@@ -9,6 +9,9 @@
 
 use std::collections::HashMap;
 use std::env::VarError;
+use std::fmt::format;
+use std::io::Read;
+use std::path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -627,6 +630,13 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: UploadRequest,
     ) -> anyhow::Result<UploadResponse> {
+        let metadata = metadata.clone();
+        let metadata2 = metadata.clone();
+
+        let bytestream_client: ByteStreamClient<
+            InterceptedService<Channel, InjectHeadersInterceptor>,
+        > = self.grpc_clients.bytestream_client.clone();
+
         upload_impl(
             &self.instance_name,
             request,
@@ -639,18 +649,29 @@ impl REClient {
                     .await?;
                 Ok(resp.into_inner())
             },
-            |segments| async {
-                let metadata = metadata.clone();
-                let mut bytestream_client = self.grpc_clients.bytestream_client.clone();
-                let requests = futures::stream::iter(segments);
-                let resp = bytestream_client
-                    .write(with_internal_metadata(requests, metadata))
-                    .await?;
-
-                Ok(resp.into_inner())
-            },
+            metadata2,
+            bytestream_client,
         )
         .await
+    }
+
+    async fn bytestream_fut_fn<I>(
+        metadata: RemoteExecutionMetadata,
+        mut bytestream_client: ByteStreamClient<
+            InterceptedService<Channel, InjectHeadersInterceptor>,
+        >,
+        it: I,
+    ) -> anyhow::Result<WriteResponse>
+    where
+        I: Iterator<Item = WriteRequest> + Send + 'static,
+    {
+        dbg!("bytestream_fut");
+        let requests = futures::stream::iter(it);
+        let k = with_internal_metadata(requests, metadata);
+
+        let resp = bytestream_client.write(k).await?;
+
+        Ok(resp.into_inner())
     }
 
     pub async fn upload_blob(
@@ -995,6 +1016,40 @@ where
             }
         }
 
+        dbg!(&req.named_digest.digest.hash);
+        dbg!(&req.named_digest.digest.size_in_bytes);
+
+        let cas_dir = match std::env::var("CAS_PATH") {
+            Ok(v) => v,
+            Err(_e) => "/home/lukas/Dokumente/OSZoo/nativelink/data/data-worker-test/content_path-cas".into(),
+        };
+
+        let path_string = format!(
+            "{}/{}-{}",
+            cas_dir,
+            &req.named_digest.digest.hash, &req.named_digest.digest.size_in_bytes
+        );
+        let path_src = std::path::PathBuf::from(path_string);
+
+        dbg!(&path_src);
+
+        if path_src.is_file() {
+            let path_dst = std::path::PathBuf::from(&req.named_digest.name);
+
+            // let r = tokio::fs::copy(&path_src,&path_dst).await?;
+            let start = std::time::Instant::now();
+
+            let r = std::fs::copy(&path_src, &path_dst).unwrap();
+            let elapsed = start.elapsed();
+
+            eprintln!("Debug: {:?}", elapsed);
+            //std::fs::set_permissions(path_dst, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000)).unwrap();
+
+            assert_eq!(r as i64, req.named_digest.digest.size_in_bytes);
+            dbg!("used fs::copy!");
+            return anyhow::Ok(());
+        }
+
         let fut = async {
             let mut file = opts
                 .open(&req.named_digest.name)
@@ -1039,16 +1094,16 @@ where
     })
 }
 
-async fn upload_impl<Byt, Cas>(
+async fn upload_impl<Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
     max_msg_size: usize,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
-    bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
+    metadata: RemoteExecutionMetadata,
+    bytestream_client: ByteStreamClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
 ) -> anyhow::Result<UploadResponse>
 where
     Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
-    Byt: Future<Output = anyhow::Result<WriteResponse>> + Send,
 {
     // NOTE if we stop recording blob_hashes, we can drop out a lot of allocations.
     let mut upload_futures: Vec<BoxFuture<anyhow::Result<Vec<String>>>> = vec![];
@@ -1059,6 +1114,8 @@ where
 
     // Create futures for any blobs that need uploading.
     for blob in request.inlined_blobs_with_digest.unwrap_or_default() {
+        let m = metadata.clone();
+        let c = bytestream_client.clone();
         let hash = blob.digest.hash.clone();
         let size = blob.digest.size_in_bytes;
 
@@ -1078,7 +1135,7 @@ where
         );
         let fut = async move {
             // Number of complete (non-partial) messages
-            let mut upload_segments = vec![];
+            let mut upload_segments: Vec<WriteRequest> = vec![];
             for (i, chunk) in data.chunks(max_msg_size).enumerate() {
                 upload_segments.push(WriteRequest {
                     resource_name: resource_name.to_owned(),
@@ -1089,7 +1146,9 @@ where
             }
             upload_segments.last_mut().unwrap().finish_write = true;
 
-            let resp = bystream_fut(upload_segments).await?;
+            //let resp = bystream_fut(upload_segments).await?;
+            let resp = REClient::bytestream_fut_fn(m, c, upload_segments.into_iter()).await?;
+
             if resp.committed_size != size {
                 return Err(anyhow::anyhow!(
                     "Failed to upload inline blob: invalid committed_size from WriteResponse"
@@ -1103,9 +1162,14 @@ where
 
     // Create futures for any files that needs uploading.
     for file in request.files_with_digest.unwrap_or_default() {
+        let m = metadata.clone();
+        let c = bytestream_client.clone();
         let hash = file.digest.hash.clone();
         let size = file.digest.size_in_bytes;
         let name = file.name.clone();
+        dbg!(&name);
+        dbg!(&size);
+        dbg!(&hash);
         if size < max_msg_size as i64 {
             batched_blob_updates.push(BatchUploadRequest::File(file));
             continue;
@@ -1122,11 +1186,19 @@ where
             let mut file = tokio::fs::File::open(&name)
                 .await
                 .with_context(|| format!("Opening `{name}` for reading failed"))?;
-            let mut data = vec![0; max_msg_size];
+            // let mut data: Vec<u8> = vec![0; max_msg_size];
+
+            tracing::warn!("max_msg_size: {:?}", max_msg_size);
+            tracing::debug!("max_msg_size: {:?}", max_msg_size);
+            //panic!("max_msg_size: {:?}", max_msg_size);
+
+            dbg!(max_msg_size);
 
             let mut write_offset = 0;
+            /*
             let mut upload_segments = Vec::new();
             loop {
+                let mut data = vec![0; max_msg_size];
                 let length = file
                     .read(&mut data)
                     .await
@@ -1134,11 +1206,12 @@ where
                 if length == 0 {
                     break;
                 }
+                data.truncate(length);
                 upload_segments.push(WriteRequest {
                     resource_name: resource_name.to_owned(),
                     write_offset,
                     finish_write: false,
-                    data: data[..length].to_owned(),
+                    data,
                 });
                 write_offset += length as i64;
             }
@@ -1146,8 +1219,38 @@ where
                 .last_mut()
                 .with_context(|| format!("Read no segments from `{name} "))?
                 .finish_write = true;
+            */
+            let f = std::fs::File::open(&name)?;
+            let mut reader = std::io::BufReader::new(f);
 
-            let resp = bystream_fut(upload_segments).await?;
+            let counter = std::iter::from_fn(move || {
+                let mut data = vec![0; max_msg_size];
+                let length = reader.read(&mut data).unwrap();
+                // dbg!(length);
+                data.truncate(length);
+
+                let mut wrq = WriteRequest {
+                    resource_name: resource_name.to_owned(),
+                    write_offset,
+                    finish_write: false,
+                    data,
+                };
+
+                if length == 0 {
+                    return None;
+                }
+                write_offset += length as i64;
+                if write_offset >= size {
+                    wrq.finish_write = true;
+                    dbg!(wrq.finish_write);
+                }
+                Some(wrq)
+            });
+
+            let resp = REClient::bytestream_fut_fn(m, c, counter).await?;
+
+            // let resp = bystream_fut(upload_segments.into_iter()).await?;
+            // let resp = REClient::bytestream_fut_fn(m,c,upload_segments.into_iter()).await?;
             if resp.committed_size != size {
                 return Err(anyhow::anyhow!(
                     "Failed to upload `{name}`: invalid committed_size from WriteResponse"
